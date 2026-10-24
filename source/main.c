@@ -2,6 +2,9 @@
 // Put .mp3 or 16-bit PCM .wav files in the "music" folder on the SD card.
 // Subfolders are supported.
 //
+// On start, every MP3 that has not been scanned yet is scanned once and a small
+// seek table is saved to sdmc:/3ds/juke3ds/cache. That makes seeking instant.
+//
 // Controls:
 //   Up/Down  choose            A  open folder / play song
 //   B        go up a folder    X  pause / resume (A on the playing song too)
@@ -18,14 +21,36 @@
 #include <sys/stat.h>
 #include <mpg123.h>
 
+#ifndef MUSIC_DIR
 #define MUSIC_DIR   "sdmc:/music"
+#endif
+#ifndef CACHE_ROOT
+#define CACHE_ROOT  "sdmc:/3ds/juke3ds"
+#endif
+#ifndef CACHE_DIR
+#define CACHE_DIR   CACHE_ROOT "/cache"
+#endif
 #define MAX_FILES   256
 #define NAME_LEN    128
 #define PATH_LEN    256
 #define NUM_BUFS    4
 #define BUF_FRAMES  8192
+#define FIRST_FRAMES 4096 // the first buffer after a start or jump is smaller, so sound starts sooner
 #define CHANNEL     0
 #define VISIBLE     24
+
+#define INDEX_STEP        32          // one saved seek point per 32 MP3 frames (about 0.8 s)
+#define MAX_INDEX_ENTRIES 1000000
+#define MAX_SONGS         8192
+#define MAX_DIRS          1024
+#define RB_SIZE           32768       // read-ahead buffer for MP3 files
+#define CACHE_MAGIC       0x4933444Au // "JD3I"
+#define CACHE_VERSION     1u
+#define HDR_WORDS         10
+#define FNV_BASIS         14695981039346656037ULL
+#define FNV_PRIME         1099511628211ULL
+
+typedef struct Rd Rd;
 
 enum { TYPE_WAV, TYPE_MP3 };
 enum { REP_OFF, REP_ALL, REP_ONE };
@@ -45,6 +70,7 @@ typedef struct {
     u32   remaining;     // bytes of audio data left
     // MP3
     mpg123_handle *mh;
+    Rd   *rd;            // buffered file reader used by the decoder
 } Track;
 
 // ---------- helpers ----------
@@ -66,6 +92,288 @@ static void copyTrimmed(char *dst, size_t dstSize, const char *src, size_t srcLe
 static void fmtTime(char *out, u32 s)
 {
     snprintf(out, 16, "%lu:%02lu", (unsigned long)(s / 60), (unsigned long)(s % 60));
+}
+
+// ---------- Buffered file reader for libmpg123 ----------
+// The SD card is slow for lots of tiny reads, and the MP3 decoder makes many of
+// them (a few bytes per frame). Reading 32 KB at a time makes scanning and
+// playback much faster. Seeks only move a pointer; the file is touched on read.
+
+struct Rd {
+    FILE  *f;
+    u8    *buf;
+    long   start;   // file offset of buf[0]
+    size_t len;     // number of valid bytes in buf
+    long   pos;     // current read position
+    long   size;    // file size
+};
+
+static void rdFree(Rd *r)
+{
+    if (!r) return;
+    if (r->f) fclose(r->f);
+    free(r->buf);
+    free(r);
+}
+
+static Rd *rdOpen(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    Rd *r = (Rd *)calloc(1, sizeof(Rd));
+    if (!r) {
+        fclose(f);
+        return NULL;
+    }
+    r->f = f;
+    r->buf = (u8 *)malloc(RB_SIZE);
+    if (!r->buf || fseek(f, 0, SEEK_END) != 0) {
+        rdFree(r);
+        return NULL;
+    }
+    r->size = ftell(f);
+    if (r->size < 0) {
+        rdFree(r);
+        return NULL;
+    }
+    return r;
+}
+
+static ssize_t rdRead(void *h, void *dst, size_t n)
+{
+    Rd *r = (Rd *)h;
+    u8 *out = (u8 *)dst;
+    size_t total = 0;
+    while (n > 0) {
+        if (r->pos < r->start || r->pos >= r->start + (long)r->len) {
+            if (fseek(r->f, r->pos, SEEK_SET) != 0) break;
+            size_t got = fread(r->buf, 1, RB_SIZE, r->f);
+            r->start = r->pos;
+            r->len = got;
+            if (got == 0) break;
+        }
+        size_t off = (size_t)(r->pos - r->start);
+        size_t avail = r->len - off;
+        size_t take = n < avail ? n : avail;
+        memcpy(out, r->buf + off, take);
+        out += take;
+        r->pos += (long)take;
+        total += take;
+        n -= take;
+    }
+    return (ssize_t)total;
+}
+
+static off_t rdSeek(void *h, off_t off, int whence)
+{
+    Rd *r = (Rd *)h;
+    long base = whence == SEEK_SET ? 0 : (whence == SEEK_CUR ? r->pos : r->size);
+    long np = base + (long)off;
+    if (np < 0) return -1;
+    r->pos = np;
+    return (off_t)np;
+}
+
+// ---------- Seek-table cache ----------
+// One small file per scanned MP3 in CACHE_DIR. It holds the exact length and a
+// table of file positions (one per INDEX_STEP frames), so libmpg123 can jump
+// straight to any point instead of reading through the file to find it.
+
+typedef struct {
+    u32  rate;
+    u32  frames;   // exact length in samples per channel
+    u32  step;     // the table has one entry per `step` MP3 frames
+    u32  fill;     // number of entries
+    u32 *offsets;  // byte positions in the file (malloc'd, or NULL)
+} Cache;
+
+static u64 fnv(u64 h, const u8 *p, size_t n)
+{
+    while (n--) {
+        h ^= *p++;
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
+static u8 fidBuf[4096];
+
+// Identifies a file by its size plus a fingerprint of its first and last 4 KB,
+// so a replaced or re-tagged file is noticed and rescanned.
+static bool fileId(const char *path, u32 *size, u64 *fp)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    bool ok = false;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long len = ftell(f);
+        if (len > 0 && fseek(f, 0, SEEK_SET) == 0) {
+            u64 h = FNV_BASIS;
+            size_t n = fread(fidBuf, 1, sizeof(fidBuf), f);
+            h = fnv(h, fidBuf, n);
+            if (len > (long)sizeof(fidBuf) && fseek(f, len - (long)sizeof(fidBuf), SEEK_SET) == 0) {
+                n = fread(fidBuf, 1, sizeof(fidBuf), f);
+                h = fnv(h, fidBuf, n);
+            }
+            *size = (u32)len;
+            *fp = h;
+            ok = true;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+static void cachePath(const char *songPath, char *out, size_t outSize)
+{
+    u64 h = fnv(FNV_BASIS, (const u8 *)songPath, strlen(songPath));
+    snprintf(out, outSize, CACHE_DIR "/%08lx%08lx.idx",
+             (unsigned long)(h >> 32), (unsigned long)(h & 0xFFFFFFFFu));
+}
+
+// Returns true if a valid, up-to-date cache entry exists for this song.
+// With wantOffsets the seek table is loaded too (the caller frees c->offsets).
+static bool cacheRead(const char *songPath, Cache *c, bool wantOffsets)
+{
+    c->offsets = NULL;
+    u32 size = 0;
+    u64 fp = 0;
+    if (!fileId(songPath, &size, &fp)) return false;
+
+    char cp[PATH_LEN];
+    cachePath(songPath, cp, sizeof(cp));
+    FILE *f = fopen(cp, "rb");
+    if (!f) return false;
+
+    bool ok = false;
+    u32 h[HDR_WORDS];
+    size_t pathLen = strlen(songPath);
+    if (fread(h, 4, HDR_WORDS, f) == HDR_WORDS &&
+        h[0] == CACHE_MAGIC && h[1] == CACHE_VERSION &&
+        h[2] == size && h[3] == (u32)(fp & 0xFFFFFFFFu) && h[4] == (u32)(fp >> 32) &&
+        h[6] > 0 && h[7] > 0 && h[8] > 0 && h[8] <= MAX_INDEX_ENTRIES && h[9] == pathLen) {
+        char stored[PATH_LEN];
+        if (pathLen < sizeof(stored) &&
+            fread(stored, 1, pathLen, f) == pathLen && memcmp(stored, songPath, pathLen) == 0) {
+            long dataStart = ftell(f);
+            // The file must be exactly as long as its header says (catches cut-off files).
+            if (dataStart > 0 && fseek(f, 0, SEEK_END) == 0 && ftell(f) == dataStart + (long)h[8] * 4) {
+                if (wantOffsets) {
+                    u32 *offs = (u32 *)malloc((size_t)h[8] * 4);
+                    if (offs && fseek(f, dataStart, SEEK_SET) == 0 && fread(offs, 4, h[8], f) == h[8]) {
+                        c->offsets = offs;
+                        ok = true;
+                    } else {
+                        free(offs);
+                    }
+                } else {
+                    ok = true;
+                }
+            }
+        }
+    }
+    fclose(f);
+    if (ok) {
+        c->rate = h[5];
+        c->frames = h[6];
+        c->step = h[7];
+        c->fill = h[8];
+    }
+    return ok;
+}
+
+static bool cacheWrite(const char *songPath, u32 size, u64 fp, const Cache *c)
+{
+    char cp[PATH_LEN];
+    cachePath(songPath, cp, sizeof(cp));
+    FILE *f = fopen(cp, "wb");
+    if (!f) {
+        // The cache folder probably doesn't exist yet: create it and try once more.
+        mkdir(CACHE_ROOT, 0777);
+        mkdir(CACHE_DIR, 0777);
+        f = fopen(cp, "wb");
+    }
+    if (!f) return false;
+
+    size_t pathLen = strlen(songPath);
+    u32 h[HDR_WORDS] = { CACHE_MAGIC, CACHE_VERSION, size, (u32)(fp & 0xFFFFFFFFu), (u32)(fp >> 32),
+                         c->rate, c->frames, c->step, c->fill, (u32)pathLen };
+    bool ok = fwrite(h, 4, HDR_WORDS, f) == HDR_WORDS &&
+              fwrite(songPath, 1, pathLen, f) == pathLen &&
+              fwrite(c->offsets, 4, c->fill, f) == c->fill;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) remove(cp);
+    return ok;
+}
+
+// Reads a whole MP3 once and saves its seek table. Returns true on success.
+static bool scanSong(const char *path)
+{
+    u32 size = 0;
+    u64 fp = 0;
+    if (!fileId(path, &size, &fp)) return false;
+    Rd *rd = rdOpen(path);
+    if (!rd) return false;
+    int err = 0;
+    mpg123_handle *mh = mpg123_new(NULL, &err);
+    if (!mh) {
+        rdFree(rd);
+        return false;
+    }
+
+    mpg123_param(mh, MPG123_FLAGS, MPG123_QUIET, 0.0);
+    mpg123_param(mh, MPG123_INDEX_SIZE, -1, 0.0); // keep every frame while scanning
+
+    bool ok = false;
+    u32 *offs = NULL;
+    if (mpg123_replace_reader_handle(mh, rdRead, rdSeek, NULL) == MPG123_OK &&
+        mpg123_open_handle(mh, rd) == MPG123_OK) {
+        long rate = 0;
+        int chans = 0, enc = 0;
+        if (mpg123_getformat(mh, &rate, &chans, &enc) == MPG123_OK && rate > 0 &&
+            mpg123_scan(mh) == MPG123_OK) {
+            off_t len = mpg123_length(mh);
+            off_t *idx = NULL;
+            off_t step = 0;
+            size_t fill = 0;
+            if (len > 0 && mpg123_index(mh, &idx, &step, &fill) == MPG123_OK &&
+                idx && step > 0 && fill > 0) {
+                // Keep only every few entries: a much smaller file, same speed.
+                u32 stride = step >= INDEX_STEP ? 1 : (u32)(INDEX_STEP / step);
+                u32 outFill = (u32)((fill + stride - 1) / stride);
+                offs = (u32 *)malloc((size_t)outFill * 4);
+                if (offs) {
+                    for (u32 i = 0; i < outFill; i++) offs[i] = (u32)idx[(size_t)i * stride];
+                    Cache c = { (u32)rate, (u32)len, (u32)(step * stride), outFill, offs };
+                    ok = cacheWrite(path, size, fp, &c);
+                }
+            }
+        }
+    }
+    free(offs);
+    mpg123_close(mh);
+    mpg123_delete(mh);
+    rdFree(rd);
+    return ok;
+}
+
+// Gives the decoder the saved seek table. Returns true (and the exact length) if it worked.
+static bool applyCache(mpg123_handle *mh, const char *path, u32 rate, u32 *frames)
+{
+    Cache c;
+    if (!cacheRead(path, &c, true)) return false;
+    bool ok = false;
+    if (c.rate == rate) {
+        off_t *idx = (off_t *)malloc((size_t)c.fill * sizeof(off_t));
+        if (idx) {
+            for (u32 i = 0; i < c.fill; i++) idx[i] = (off_t)c.offsets[i];
+            ok = mpg123_set_index(mh, idx, (off_t)c.step, (size_t)c.fill) == MPG123_OK;
+            free(idx);
+            if (ok) *frames = c.frames;
+        }
+    }
+    free(c.offsets);
+    return ok;
 }
 
 // ---------- WAV ----------
@@ -141,13 +449,18 @@ static u32 wavRead(Track *t, s16 *dst, u32 maxFrames)
 
 static bool mp3Open(Track *t, const char *path)
 {
+    Rd *rd = rdOpen(path);
+    if (!rd) return false;
+
     int err = 0;
     mpg123_handle *mh = mpg123_new(NULL, &err);
-    if (!mh) return false;
+    if (!mh) {
+        rdFree(rd);
+        return false;
+    }
 
     // Always decode to 16-bit stereo, at whatever sample rate the file uses.
-    // FUZZY + a growing index make seeking much faster (it no longer has to
-    // read through the whole file to find the exact spot).
+    // FUZZY keeps seeking reasonably fast for songs that haven't been scanned yet.
     mpg123_param(mh, MPG123_FLAGS, MPG123_FORCE_STEREO | MPG123_QUIET | MPG123_FUZZY, 0.0);
     mpg123_param(mh, MPG123_INDEX_SIZE, -1, 0.0);
     mpg123_format_none(mh);
@@ -157,8 +470,10 @@ static bool mp3Open(Track *t, const char *path)
     for (size_t i = 0; i < nrates; i++)
         mpg123_format(mh, rates[i], MPG123_STEREO, MPG123_ENC_SIGNED_16);
 
-    if (mpg123_open(mh, path) != MPG123_OK) {
+    if (mpg123_replace_reader_handle(mh, rdRead, rdSeek, NULL) != MPG123_OK ||
+        mpg123_open_handle(mh, rd) != MPG123_OK) {
         mpg123_delete(mh);
+        rdFree(rd);
         return false;
     }
 
@@ -167,18 +482,26 @@ static bool mp3Open(Track *t, const char *path)
     if (mpg123_getformat(mh, &rate, &chans, &enc) != MPG123_OK || enc != MPG123_ENC_SIGNED_16 || rate <= 0) {
         mpg123_close(mh);
         mpg123_delete(mh);
+        rdFree(rd);
         return false;
     }
 
     t->type = TYPE_MP3;
     t->mh = mh;
+    t->rd = rd;
     t->channels = 2;
     t->rate = (u32)rate;
     t->eof = false;
 
-    // Length (estimate) and tags
-    off_t len = mpg123_length(mh);
-    if (len > 0) t->totalSec = (u32)(len / rate);
+    // Exact length and instant seeking if the song has been scanned,
+    // otherwise an estimated length.
+    u32 exactFrames = 0;
+    if (applyCache(mh, path, (u32)rate, &exactFrames)) {
+        t->totalSec = exactFrames / (u32)rate;
+    } else {
+        off_t len = mpg123_length(mh);
+        if (len > 0) t->totalSec = (u32)(len / rate);
+    }
 
     mpg123_id3v1 *v1 = NULL;
     mpg123_id3v2 *v2 = NULL;
@@ -240,6 +563,7 @@ static void trackClose(Track *t)
         mpg123_close(t->mh);
         mpg123_delete(t->mh);
     }
+    rdFree(t->rd);
     memset(t, 0, sizeof(*t));
 }
 
@@ -252,6 +576,7 @@ static s16        *audioMem = NULL;
 static bool        playing = false;
 static bool        paused = false;
 static u64         doneFrames = 0; // frames that have finished playing
+static bool        firstFill = true;
 
 static void stopPlayback(void)
 {
@@ -296,6 +621,7 @@ static bool startPlayback(const char *path)
     }
 
     doneFrames = 0;
+    firstFill = true;
     playing = true;
     paused = false;
     return true;
@@ -320,13 +646,15 @@ static bool updatePlayback(void)
         }
         if (track.eof) continue;
 
-        u32 n = trackRead(&track, (s16 *)b->data_vaddr, BUF_FRAMES);
+        u32 n = trackRead(&track, (s16 *)b->data_vaddr, firstFill ? FIRST_FRAMES : BUF_FRAMES);
         if (n == 0) continue;
         b->nsamples = n;
         DSP_FlushDataCache(b->data_vaddr, n * track.channels * 2);
         ndspChnWaveBufAdd(CHANNEL, b);
         filled[i] = true;
         anyActive = true;
+        firstFill = false;
+        break; // fill only one buffer per frame, so sound can start right away
     }
 
     if (!anyActive && track.eof) {
@@ -368,6 +696,7 @@ static bool seekToSecond(u32 sec)
         bufs[i].status = NDSP_WBUF_DONE;
     }
     doneFrames = frame;
+    firstFill = true;
     return true;
 }
 
@@ -559,6 +888,138 @@ static void drawBottom(void)
     if (msg[0]) printf("%s\n", msg);
 }
 
+// ---------- Library scan (runs at start) ----------
+
+static void presentFrame(void)
+{
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+    gspWaitForVBlank();
+}
+
+static bool pushStr(char ***arr, int *count, int *cap, const char *str)
+{
+    if (*count == *cap) {
+        int ncap = *cap ? *cap * 2 : 64;
+        char **na = (char **)realloc(*arr, (size_t)ncap * sizeof(char *));
+        if (!na) return false;
+        *arr = na;
+        *cap = ncap;
+    }
+    size_t n = strlen(str) + 1;
+    char *copy = (char *)malloc(n);
+    if (!copy) return false;
+    memcpy(copy, str, n);
+    (*arr)[(*count)++] = copy;
+    return true;
+}
+
+static void freeStrs(char **arr, int count)
+{
+    for (int i = 0; i < count; i++) free(arr[i]);
+    free(arr);
+}
+
+static void drawMessage(const char *text)
+{
+    consoleSelect(&topScreen);
+    consoleClear();
+    printf("Juke3DS\n\n%s\n", text);
+    presentFrame();
+}
+
+static void drawScan(int done, int total, const char *path)
+{
+    consoleSelect(&topScreen);
+    consoleClear();
+    printf("Juke3DS\n\n");
+    printf("Preparing your music library\n");
+    printf("Only new songs are scanned, so this\n");
+    printf("is much quicker next time.\n\n");
+
+    char bar[41];
+    int width = 40;
+    int filledChars = total > 0 ? (int)((long long)done * width / total) : 0;
+    for (int i = 0; i < width; i++) bar[i] = i < filledChars ? '#' : '-';
+    bar[width] = 0;
+    printf("[%s]\n%d / %d\n\n", bar, done, total);
+
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    printf("%.49s\n", name);
+
+    printf("\x1b[27;1HHold B to skip (continues next time)\n");
+    printf("Press START to exit\n");
+    presentFrame();
+}
+
+// Finds every MP3 under the music folder and scans the ones that have no
+// up-to-date cache entry. Returns false if the user chose to exit the app.
+static bool libraryScan(void)
+{
+    drawMessage("Checking your music library...");
+
+    char **songs = NULL, **dirs = NULL;
+    int songCount = 0, songCap = 0, dirCount = 0, dirCap = 0;
+
+    // Walk the folders one at a time (a list instead of recursion, so only one
+    // directory is ever open).
+    pushStr(&dirs, &dirCount, &dirCap, MUSIC_DIR);
+    for (int di = 0; di < dirCount; di++) {
+        DIR *d = opendir(dirs[di]);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            size_t dl = strlen(dirs[di]), nl = strlen(e->d_name);
+            if (nl >= NAME_LEN || dl + nl + 2 >= PATH_LEN) continue;
+            char full[PATH_LEN];
+            snprintf(full, sizeof(full), "%s/%s", dirs[di], e->d_name);
+            struct stat st;
+            if (stat(full, &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                if (dirCount < MAX_DIRS) pushStr(&dirs, &dirCount, &dirCap, full);
+            } else if (hasExt(e->d_name, ".mp3") && songCount < MAX_SONGS) {
+                pushStr(&songs, &songCount, &songCap, full);
+            }
+        }
+        closedir(d);
+    }
+
+    // Which songs still need a scan?
+    int *pend = songCount > 0 ? (int *)malloc((size_t)songCount * sizeof(int)) : NULL;
+    int pendCount = 0;
+    if (pend) {
+        for (int i = 0; i < songCount; i++) {
+            Cache c;
+            if (!cacheRead(songs[i], &c, false)) pend[pendCount++] = i;
+        }
+    }
+
+    bool quit = false;
+    for (int i = 0; i < pendCount; i++) {
+        if (!aptMainLoop()) {
+            quit = true;
+            break;
+        }
+        hidScanInput();
+        u32 held = hidKeysHeld();
+        if (held & KEY_START) {
+            quit = true;
+            break;
+        }
+        if (held & KEY_B) break; // skip the rest; it continues on the next launch
+
+        drawScan(i, pendCount, songs[pend[i]]);
+        scanSong(songs[pend[i]]); // a song that fails here is simply retried next launch
+    }
+
+    free(pend);
+    freeStrs(songs, songCount);
+    freeStrs(dirs, dirCount);
+    return !quit;
+}
+
 // ---------- Main ----------
 
 int main(void)
@@ -590,6 +1051,14 @@ int main(void)
     audioMem = (s16 *)linearAlloc((size_t)NUM_BUFS * BUF_FRAMES * 2 * sizeof(s16));
     mpg123_init();
     srand((unsigned)osGetTime());
+
+    if (!libraryScan()) {
+        mpg123_exit();
+        ndspExit();
+        linearFree(audioMem);
+        gfxExit();
+        return 0;
+    }
 
     scanDir();
 
