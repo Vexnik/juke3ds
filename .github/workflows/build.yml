@@ -1,4 +1,4 @@
-name: Build 3DS app
+name: Build Juke3DS
 
 on:
   push:
@@ -17,5 +17,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: musicplayer
-          path: musicplayer.3dsx
+          name: juke3ds
+          path: juke3ds.3dsx
