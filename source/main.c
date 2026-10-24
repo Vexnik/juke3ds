@@ -4,8 +4,8 @@
 //
 // Controls:
 //   Up/Down  choose            A  open folder / play song
-//   B        go up a folder    X  pause / resume
-//   Left/Right  volume         L/R  previous / next song
+//   B        go up a folder    X  pause / resume (A on the playing song too)
+//   Left/Right  skip 10 sec    L/R  previous / next song
 //   Y        shuffle on/off    SELECT  repeat: off / all / one
 //   START    exit
 
@@ -40,6 +40,8 @@ typedef struct {
     char  artist[96];
     // WAV
     FILE *f;
+    long  dataStart;     // where the audio data begins in the file
+    u32   dataSize;      // total bytes of audio data
     u32   remaining;     // bytes of audio data left
     // MP3
     mpg123_handle *mh;
@@ -104,6 +106,8 @@ static bool wavOpen(Track *t, const char *path)
             if (!gotFmt || t->rate == 0) break;
             t->type = TYPE_WAV;
             t->f = f;
+            t->dataStart = ftell(f);
+            t->dataSize = size;
             t->remaining = size;
             t->eof = false;
             t->totalSec = size / (t->rate * t->channels * 2);
@@ -256,14 +260,8 @@ static void stopPlayback(void)
     paused = false;
 }
 
-static bool startPlayback(const char *path)
+static void configureChannel(void)
 {
-    stopPlayback();
-    if (!trackOpen(&track, path)) {
-        trackClose(&track);
-        return false;
-    }
-
     ndspChnReset(CHANNEL);
     ndspChnSetInterp(CHANNEL, NDSP_INTERP_LINEAR);
     ndspChnSetRate(CHANNEL, (float)track.rate);
@@ -274,6 +272,17 @@ static bool startPlayback(const char *path)
     mix[0] = 1.0f;
     mix[1] = 1.0f;
     ndspChnSetMix(CHANNEL, mix);
+}
+
+static bool startPlayback(const char *path)
+{
+    stopPlayback();
+    if (!trackOpen(&track, path)) {
+        trackClose(&track);
+        return false;
+    }
+
+    configureChannel();
     ndspChnSetPaused(CHANNEL, false);
 
     memset(bufs, 0, sizeof(bufs));
@@ -330,6 +339,35 @@ static u32 elapsedSeconds(void)
     return (u32)(doneFrames / track.rate);
 }
 
+// Jump to a position in the current song. Returns false if that isn't possible.
+static bool seekToSecond(u32 sec)
+{
+    if (!playing || track.rate == 0) return false;
+    u64 frame = (u64)sec * track.rate;
+
+    if (track.type == TYPE_MP3) {
+        if (mpg123_seek(track.mh, (off_t)frame, SEEK_SET) < 0) return false;
+    } else {
+        u64 byteOff = frame * track.channels * 2;
+        if (byteOff >= track.dataSize) return false;
+        fseek(track.f, track.dataStart + (long)byteOff, SEEK_SET);
+        track.remaining = track.dataSize - (u32)byteOff;
+    }
+    track.eof = false;
+
+    // Throw away the audio that was already queued and start fresh from here.
+    configureChannel();
+    ndspChnSetPaused(CHANNEL, paused);
+    memset(bufs, 0, sizeof(bufs));
+    memset(filled, 0, sizeof(filled));
+    for (int i = 0; i < NUM_BUFS; i++) {
+        bufs[i].data_vaddr = audioMem + (size_t)i * BUF_FRAMES * 2;
+        bufs[i].status = NDSP_WBUF_DONE;
+    }
+    doneFrames = frame;
+    return true;
+}
+
 // ---------- Folder browser ----------
 
 typedef struct {
@@ -360,6 +398,278 @@ static void scanDir(void)
     }
 
     DIR *d = opendir(curDir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && entryCount < MAX_FILES) {
+        if (e->d_name[0] == '.') continue;
+        if (strlen(e->d_name) >= NAME_LEN) continue;
+        if (strlen(curDir) + strlen(e->d_name) + 2 >= PATH_LEN) continue;
+
+        char full[PATH_LEN];
+        snprintf(full, sizeof(full), "%s/%s", curDir, e->d_name);
+        struct stat st;
+        bool isDir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+
+        if (!isDir && !hasExt(e->d_name, ".mp3") && !hasExt(e->d_name, ".wav")) continue;
+        strcpy(entries[entryCount].name, e->d_name);
+        entries[entryCount].dir = isDir;
+        entryCount++;
+    }
+    closedir(d);
+    qsort(entries + start, entryCount - start, sizeof(Entry), cmpEntries);
+}
+
+// ---------- Playlist (the songs of the folder you started playing from) ----------
+
+static char plNames[MAX_FILES][NAME_LEN];
+static char plDir[PATH_LEN];
+static int  plCount = 0;
+static int  order[MAX_FILES];
+static int  pos = 0;
+static bool shuffle = false;
+static int  repeat = REP_OFF;
+static char msg[64] = "";
+
+static void buildOrder(int curIdx)
+{
+    for (int i = 0; i < plCount; i++) order[i] = i;
+    if (shuffle && plCount > 1) {
+        int tmp = order[0];
+        order[0] = order[curIdx];
+        order[curIdx] = tmp;
+        for (int i = plCount - 1; i > 1; i--) {
+            int j = 1 + rand() % i;
+            tmp = order[i];
+            order[i] = order[j];
+            order[j] = tmp;
+        }
+        pos = 0;
+    } else {
+        pos = curIdx;
+    }
+}
+
+static bool playPos(void)
+{
+    char path[PATH_LEN + NAME_LEN];
+    snprintf(path, sizeof(path), "%s/%s", plDir, plNames[order[pos]]);
+    return startPlayback(path);
+}
+
+// dir = +1 next, -1 previous. automatic = the song ended by itself.
+static void advance(int dir, bool automatic)
+{
+    if (plCount == 0) return;
+    for (int tries = 0; tries < plCount; tries++) {
+        if (dir > 0) {
+            if (pos + 1 < plCount) pos++;
+            else if (repeat == REP_ALL || !automatic) pos = 0;
+            else return; // end of the list: stop
+        } else {
+            if (pos > 0) pos--;
+            else pos = plCount - 1;
+        }
+        if (playPos()) {
+            msg[0] = 0;
+            return;
+        }
+    }
+    snprintf(msg, sizeof(msg), "No playable files");
+}
+
+static void startFromList(int sel)
+{
+    plCount = 0;
+    int idx = 0;
+    for (int i = 0; i < entryCount; i++) {
+        if (entries[i].dir) continue;
+        if (i == sel) idx = plCount;
+        strcpy(plNames[plCount++], entries[i].name);
+    }
+    strcpy(plDir, curDir);
+    buildOrder(idx);
+    if (playPos()) msg[0] = 0;
+    else snprintf(msg, sizeof(msg), "Can't play that file");
+}
+
+// ---------- Screens ----------
+
+static PrintConsole topScreen, bottomScreen;
+
+static void drawTop(int sel, int top)
+{
+    consoleSelect(&topScreen);
+    consoleClear();
+    printf("3DS Music Player\n");
+    printf("%.49s\n", curDir + 5); // skip the "sdmc:" prefix
+    printf("--------------------------------------------------\n");
+
+    if (entryCount == 0) {
+        printf("No .mp3 or .wav files here.\n");
+    }
+    for (int i = top; i < entryCount && i < top + VISIBLE; i++) {
+        if (entries[i].dir) printf("%c [%.44s]\n", i == sel ? '>' : ' ', entries[i].name);
+        else                printf("%c %.46s\n",   i == sel ? '>' : ' ', entries[i].name);
+    }
+    printf("\x1b[29;1H%d items", entryCount);
+}
+
+static void drawBottom(void)
+{
+    consoleSelect(&bottomScreen);
+    consoleClear();
+    printf("NOW PLAYING\n");
+    printf("----------------------------------------\n");
+
+    if (playing) {
+        printf("%.39s\n", track.title);
+        printf("%.39s\n\n", track.artist);
+
+        char a[16], b[16];
+        u32 el = elapsedSeconds();
+        fmtTime(a, el);
+        char bar[32];
+        int width = 28;
+        int filledChars = 0;
+        if (track.totalSec > 0) {
+            u64 f = (u64)el * width / track.totalSec;
+            filledChars = f > (u64)width ? width : (int)f;
+            fmtTime(b, track.totalSec);
+        } else {
+            strcpy(b, "--:--");
+        }
+        for (int i = 0; i < width; i++) bar[i] = i < filledChars ? '#' : '-';
+        bar[width] = 0;
+        printf("[%s]\n", bar);
+        printf("%s / %s%s\n\n", a, b, paused ? "   (paused)" : "");
+    } else {
+        printf("Nothing playing\n\n\n\n\n\n");
+    }
+
+    printf("Shuffle: %s\n", shuffle ? "on" : "off");
+    printf("Repeat:  %s\n", repeat == REP_OFF ? "off" : (repeat == REP_ALL ? "all" : "one"));
+
+    printf("\x1b[22;1H----------------------------------------\n");
+    printf("A play/open/pause  B back  X pause\n");
+    printf("L/R prev/next Y shuffle SELECT repeat\n");
+    printf("Left/Right skip 10s     START exit\n");
+    if (msg[0]) printf("%s\n", msg);
+}
+
+// ---------- Main ----------
+
+int main(void)
+{
+    gfxInitDefault();
+    consoleInit(GFX_TOP, &topScreen);
+    consoleInit(GFX_BOTTOM, &bottomScreen);
+    consoleSelect(&topScreen);
+    osSetSpeedupEnable(true); // faster CPU on New 3DS, ignored on old models
+
+    if (R_FAILED(ndspInit())) {
+        printf("Could not start the audio system.\n\n");
+        printf("You need the DSP firmware file on your\n");
+        printf("SD card: sdmc:/3ds/dspfirm.cdc\n");
+        printf("Run the \"DSP1\" homebrew app to create it.\n\n");
+        printf("Press START to exit.\n");
+        while (aptMainLoop()) {
+            hidScanInput();
+            if (hidKeysDown() & KEY_START) break;
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
+        }
+        gfxExit();
+        return 0;
+    }
+
+    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+    audioMem = (s16 *)linearAlloc((size_t)NUM_BUFS * BUF_FRAMES * 2 * sizeof(s16));
+    mpg123_init();
+    srand((unsigned)osGetTime());
+
+    scanDir();
+
+    int  sel = 0, top = 0;
+    bool topDirty = true, bottomDirty = true;
+    u32  lastSecond = 0;
+
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 down = hidKeysDown();
+        if (down & KEY_START) break;
+
+        // --- browsing ---
+        if ((down & KEY_DOWN) && sel < entryCount - 1) { sel++; topDirty = true; }
+        if ((down & KEY_UP) && sel > 0)                { sel--; topDirty = true; }
+
+        if ((down & KEY_A) && entryCount > 0) {
+            Entry *e = &entries[sel];
+            if (e->dir && strcmp(e->name, "..") != 0) {
+                if (strlen(curDir) + strlen(e->name) + 2 < PATH_LEN) {
+                    strcat(curDir, "/");
+                    strcat(curDir, e->name);
+                    scanDir();
+                    sel = 0;
+                    top = 0;
+                }
+            } else if (e->dir) {
+                down |= KEY_B; // ".." acts like B
+            } else if (playing && plCount > 0 && strcmp(plDir, curDir) == 0 &&
+                       strcmp(plNames[order[pos]], e->name) == 0) {
+                // A on the song that is already loaded: pause / resume it
+                paused = !paused;
+                ndspChnSetPaused(CHANNEL, paused);
+            } else {
+                startFromList(sel);
+            }
+            topDirty = bottomDirty = true;
+        }
+
+        if ((down & KEY_B) && strcmp(curDir, MUSIC_DIR) != 0) {
+            char *slash = strrchr(curDir, '/');
+            if (slash) {
+                char last[NAME_LEN];
+                strncpy(last, slash + 1, NAME_LEN - 1);
+                last[NAME_LEN - 1] = 0;
+                *slash = 0;
+                scanDir();
+                sel = 0;
+                for (int i = 0; i < entryCount; i++)
+                    if (strcasecmp(entries[i].name, last) == 0) sel = i;
+                top = sel - VISIBLE / 2;
+                if (top < 0) top = 0;
+            }
+            topDirty = true;
+        }
+
+        // --- playback controls ---
+        if ((down & KEY_X) && playing) {
+            paused = !paused;
+            ndspChnSetPaused(CHANNEL, paused);
+            bottomDirty = true;
+        }
+        if ((down & KEY_LEFT) && playing) {
+            u32 el = elapsedSeconds();
+            seekToSecond(el > 10 ? el - 10 : 0);
+            bottomDirty = true;
+        }
+        if ((down & KEY_RIGHT) && playing) {
+            u32 target = elapsedSeconds() + 10;
+            if (track.totalSec == 0 || target < track.totalSec) seekToSecond(target);
+            bottomDirty = true;
+        }
+
+        if (down & KEY_Y) {
+            shuffle = !shuffle;
+            if (plCount > 0) buildOrder(order[pos]);
+            bottomDirty = true;
+        }
+        if (down & KEY_SELECT) {
+            repeat = (repeat + 1) % 3;
+            bottomDirty = true;
+        }
+        if ((down & KEY_R) && plCount > 0) { advance(+1, frDir);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) != NULL && entryCount < MAX_FILES) {
