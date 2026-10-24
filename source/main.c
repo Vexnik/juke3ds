@@ -1,4 +1,4 @@
-// Music player for the Nintendo 3DS family (MP3 + WAV).
+// Juke3DS - music player for the Nintendo 3DS family (MP3 + WAV so far).
 // Put .mp3 or 16-bit PCM .wav files in the "music" folder on the SD card.
 // Subfolders are supported.
 //
@@ -503,7 +503,7 @@ static void drawTop(int sel, int top)
 {
     consoleSelect(&topScreen);
     consoleClear();
-    printf("3DS Music Player\n");
+    printf("Juke3DS\n");
     printf("%.49s\n", curDir + 5); // skip the "sdmc:" prefix
     printf("--------------------------------------------------\n");
 
