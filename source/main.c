@@ -146,7 +146,10 @@ static bool mp3Open(Track *t, const char *path)
     if (!mh) return false;
 
     // Always decode to 16-bit stereo, at whatever sample rate the file uses.
-    mpg123_param(mh, MPG123_FLAGS, MPG123_FORCE_STEREO | MPG123_QUIET, 0.0);
+    // FUZZY + a growing index make seeking much faster (it no longer has to
+    // read through the whole file to find the exact spot).
+    mpg123_param(mh, MPG123_FLAGS, MPG123_FORCE_STEREO | MPG123_QUIET | MPG123_FUZZY, 0.0);
+    mpg123_param(mh, MPG123_INDEX_SIZE, -1, 0.0);
     mpg123_format_none(mh);
     const long *rates = NULL;
     size_t nrates = 0;
