@@ -1,5 +1,7 @@
 .RECIPEPREFIX := >
 
+TARGET := juke3ds
+
 DEVKITPRO ?= /opt/devkitpro
 DEVKITARM ?= $(DEVKITPRO)/devkitARM
 
@@ -14,17 +16,16 @@ CFLAGS  := -g -Wall -O2 -mword-relocations -ffunction-sections $(ARCH) \
 LDFLAGS := -specs=3dsx.specs -g $(ARCH) -L$(LIBCTRU)/lib -L$(PORTLIBS)/lib
 LIBS    := -lmpg123 -lctru -lm
 
-all: musicplayer.3dsx
+all: $(TARGET).3dsx
 
-musicplayer.elf: source/main.c
+$(TARGET).elf: source/main.c
 > $(CC) $(CFLAGS) $< $(LDFLAGS) $(LIBS) -o $@
 
-musicplayer.smdh:
-> $(TOOLS)/smdhtool --create "Music Player" "MP3 and WAV player" "Homebrew" $(LIBCTRU)/default_icon.png $@
+$(TARGET).smdh:
+> $(TOOLS)/smdhtool --create "Juke3DS" "Music player for the 3DS family" "Vexnik" $(LIBCTRU)/default_icon.png $@
 
-musicplayer.3dsx: musicplayer.elf musicplayer.smdh
-> $(TOOLS)/3dsxtool $< $@ --smdh=musicplayer.smdh
+$(TARGET).3dsx: $(TARGET).elf $(TARGET).smdh
+> $(TOOLS)/3dsxtool $< $@ --smdh=$(TARGET).smdh
 
 clean:
-> rm -f musicplayer.elf musicplayer.smdh musicplayer.3dsx
-
+> rm -f $(TARGET).elf $(TARGET).smdh $(TARGET).3dsx
