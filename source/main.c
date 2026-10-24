@@ -667,39 +667,3 @@ int main(void)
     gfxExit();
     return 0;
 }
-    snprintf(msg, sizeof(msg), "Can't play that file");
-            }
-            dirty = true;
-        }
-        if ((down & KEY_X) && playing) {
-            paused = !paused;
-            ndspChnSetPaused(CHANNEL, paused);
-            dirty = true;
-        }
-        if (down & KEY_B) {
-            stopPlayback();
-            dirty = true;
-        }
-
-        updatePlayback();
-        if (wasPlaying && !playing) dirty = true; // song ended on its own
-        wasPlaying = playing;
-
-        if (dirty) {
-            draw(sel, top, nowPlaying, msg);
-            dirty = false;
-        }
-
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
-    }
-
-    stopPlayback();
-    mpg123_exit();
-    ndspExit();
-    linearFree(audioMem);
-    gfxExit();
-    return 0;
-}
-
