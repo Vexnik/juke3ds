@@ -10,8 +10,8 @@ jobs:
     container: devkitpro/devkitarm
     steps:
       - uses: actions/checkout@v4
-      - name: Install MP3 library
-        run: dkp-pacman -Syu --noconfirm 3ds-mpg123
+      - name: Install MP3 library (only if the image doesn't have it)
+        run: dkp-pacman -Q 3ds-mpg123 || dkp-pacman -Syu --noconfirm 3ds-mpg123
       - name: Build
         run: make
       - name: Upload
